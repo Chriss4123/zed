@@ -8,11 +8,11 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, IsZero, ListState, ParentElement, Render, RetainAllImageCache, Styled,
+    IntoElement, IsZero, ListState, ParentElement, Pixels, Render, RetainAllImageCache, Styled,
     Subscription, Task, WeakEntity, Window, list,
 };
 use language::LanguageRegistry;
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use theme::ThemeSettings;
 use ui::{WithScrollbar, prelude::*};
 use workspace::item::{Item, ItemHandle};
@@ -42,6 +42,8 @@ pub struct MarkdownPreviewView {
     mermaid_state: MermaidState,
     parsing_markdown_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
+    last_buffer_font_size: Pixels,
+    last_buffer_line_height: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -205,7 +207,8 @@ impl MarkdownPreviewView {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            let list_state = ListState::new(0, gpui::ListAlignment::Top, px(1000.));
+            let list_state = Self::new_preview_list_state(0);
+            let (buffer_font_size, buffer_line_height) = Self::current_buffer_typography(cx);
 
             let mut this = Self {
                 selected_block: 0,
@@ -219,9 +222,16 @@ impl MarkdownPreviewView {
                 parsing_markdown_task: None,
                 image_cache: RetainAllImageCache::new(cx),
                 mode,
+                last_buffer_font_size: buffer_font_size,
+                last_buffer_line_height: buffer_line_height,
             };
 
             this.set_editor(active_editor, window, cx);
+
+            cx.observe_global_in::<SettingsStore>(window, |this, _, cx| {
+                this.handle_settings_changed(cx);
+            })
+            .detach();
 
             if mode == MarkdownPreviewMode::Follow {
                 if let Some(workspace) = &workspace.upgrade() {
@@ -237,6 +247,38 @@ impl MarkdownPreviewView {
 
             this
         })
+    }
+
+    fn new_preview_list_state(item_count: usize) -> ListState {
+        // The preview scrollbar should reflect the full document height immediately, not only the
+        // blocks that happen to be visible in the first frame.
+        ListState::new(item_count, gpui::ListAlignment::Top, px(1000.)).measure_all()
+    }
+
+    fn current_buffer_typography(cx: &App) -> (Pixels, f32) {
+        let settings = ThemeSettings::get_global(cx);
+        (
+            settings.buffer_font_size(cx),
+            settings.buffer_line_height.value(),
+        )
+    }
+
+    fn handle_settings_changed(&mut self, cx: &mut Context<Self>) {
+        let (buffer_font_size, buffer_line_height) = Self::current_buffer_typography(cx);
+        if buffer_font_size == self.last_buffer_font_size
+            && buffer_line_height == self.last_buffer_line_height
+        {
+            return;
+        }
+
+        self.last_buffer_font_size = buffer_font_size;
+        self.last_buffer_line_height = buffer_line_height;
+        self.remeasure_list(cx);
+    }
+
+    pub(crate) fn remeasure_list(&mut self, cx: &mut Context<Self>) {
+        self.list_state.remeasure();
+        cx.notify();
     }
 
     fn workspace_updated(
@@ -671,5 +713,47 @@ impl Render for MarkdownPreviewView {
                 )
             }))
             .vertical_scrollbar_for(&self.list_state, window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{
+        AppContext, Context, Element, IntoElement, ListState, Render, Styled, TestAppContext,
+        Window, div, list, point, px, size,
+    };
+
+    use super::MarkdownPreviewView;
+
+    struct PreviewListTestView {
+        list_state: ListState,
+    }
+
+    impl Render for PreviewListTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            list(self.list_state.clone(), |_, _, _| {
+                div().h(px(50.)).w_full().into_any()
+            })
+            .w_full()
+            .h_full()
+        }
+    }
+
+    #[gpui::test]
+    fn preview_list_measures_all_items_for_scrollbar(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let list_state = MarkdownPreviewView::new_preview_list_state(50);
+        let view = cx.update(|_, cx| {
+            cx.new(|_| PreviewListTestView {
+                list_state: list_state.clone(),
+            })
+        });
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert_eq!(list_state.max_offset_for_scrollbar().y, px(2300.));
     }
 }

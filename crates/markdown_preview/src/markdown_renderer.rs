@@ -141,10 +141,7 @@ impl CachedMermaidDiagram {
                 })
                 .await;
             let _ = result_clone.set(value);
-            this.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.remeasure_list(cx)).ok();
         });
 
         Self {
